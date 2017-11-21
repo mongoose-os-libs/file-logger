@@ -65,7 +65,11 @@ static char *get_new_log_filename(void) {
   double td = mg_time();
   time_t t = (time_t) td;
   struct tm tm;
+#ifdef _REENT
   localtime_r(&t, &tm);
+#else
+  memcpy(&tm, localtime(&t), sizeof(tm));
+#endif
   mg_asprintf(&ret, 0, "%.*s/%s%.4d%.2d%.2d-%.2d%.2d%.2d.%.3d.txt", logsdir.len,
               logsdir.p, mgos_sys_config_get_file_logger_prefix(),
               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
@@ -83,7 +87,7 @@ static void init_curfile(void) {
     LOG(LL_ERROR, ("failed to open log file '%s'", s_curfilename));
     return;
   }
-  setlinebuf(s_curfile);
+  setvbuf(s_curfile, NULL, _IOLBF, 256);
 }
 
 static void debug_write_hook(enum mgos_hook_type type,
@@ -111,7 +115,7 @@ static void debug_write_hook(enum mgos_hook_type type,
 
       if (log_files_cnt > mgos_sys_config_get_file_logger_max_num_files()) {
         /* Yes, there are too many; delete the found oldest one */
-        unlink(oldest);
+        remove(oldest);
         log_files_cnt--;
       }
 
