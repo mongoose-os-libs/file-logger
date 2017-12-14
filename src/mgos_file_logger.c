@@ -90,8 +90,10 @@ static void init_curfile(void) {
   setvbuf(s_curfile, NULL, _IOLBF, 256);
 }
 
-static void debug_write_hook(enum mgos_hook_type type,
-                             const struct mgos_hook_arg *arg, void *userdata) {
+static void debug_write_cb(int ev, void *ev_data, void *userdata) {
+  const struct mgos_debug_hook_arg *arg =
+      (const struct mgos_debug_hook_arg *) ev_data;
+
   if (s_curfile == NULL) {
     /*
      * It could happen if only there was an issue with opening a file:
@@ -126,10 +128,10 @@ static void debug_write_hook(enum mgos_hook_type type,
 
   /* Finally, write piece of data to the current log file */
   if (s_curfile != NULL) {
-    fwrite(arg->debug.data, arg->debug.len, 1, s_curfile);
+    fwrite(arg->data, arg->len, 1, s_curfile);
   }
 
-  (void) type;
+  (void) ev;
   (void) userdata;
 }
 
@@ -146,7 +148,7 @@ bool mgos_file_logger_init(void) {
 
   init_curfile();
 
-  mgos_hook_register(MGOS_HOOK_DEBUG_WRITE, debug_write_hook, NULL);
+  mgos_event_add_handler(MGOS_EVENT_LOG, debug_write_cb, NULL);
 
   return true;
 }
