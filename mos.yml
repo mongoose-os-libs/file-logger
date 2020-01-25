@@ -3,6 +3,9 @@ type: lib
 description: File logger library
 version: 1.0
 
+includes:
+  - include
+
 sources:
   - src
 
@@ -16,6 +19,8 @@ config_schema:
   - ["file_logger.timestamps", "b", true, {"title": "Add timestamps to entries (uptime)"}]
   - ["file_logger.level", "i", 2, {"title": "Maximum log level for messages to get logged"}]
   - ["file_logger.include", "s", "", {"title": "A comma-separated list of substrings. If set, only messages containing one of these are logged."}]
+  - ["file_logger.syslog_enable", "b", true, {"title": "Capture system log messages"}]
+  - ["file_logger.rpc_service_enable", "b", false, {"title": "Export RPC service for management"}]
 
 tags:
   - c
@@ -28,3 +33,4 @@ libs:
 
 init_after:
   - fstab
+  - rpc-common
