@@ -20,3 +20,7 @@ libs:
 config_schema:
   - ["file_logger.enable", true]
 ```
+
+## Fetching logs
+
+See [this script](tools/fetch_logs.sh).

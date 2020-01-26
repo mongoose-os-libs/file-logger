@@ -22,10 +22,10 @@
 #include "mgos_rpc.h"
 #endif
 
+static bool s_rotate = false;
 static bool s_log_wall_time = false;
 static unsigned int s_seq = 0;
 static FILE *s_curfile = NULL;
-static bool s_rotate = false;
 
 // Old name format: log_20200124-002925.706.txt
 static bool is_old_name(const char *name, size_t prefix_len) {
@@ -170,6 +170,14 @@ static char *get_new_log_filename(void) {
   return ret;
 }
 
+static void set_file_buf(FILE *fp) {
+  if (fp == NULL) return;
+  if (mgos_sys_config_get_file_logger_buf_size() < 0) return;
+  setvbuf(fp, NULL,
+          (mgos_sys_config_get_file_logger_buf_line() ? _IOLBF : _IOFBF),
+          mgos_sys_config_get_file_logger_buf_size());
+}
+
 static bool init_file(size_t msg_len) {
   bool res = false;
   int num_files = -1;
@@ -184,12 +192,7 @@ static bool init_file(size_t msg_len) {
       s_seq = newest_seq;
       s_curfile = fopen(newest, "a");
       if (s_curfile != NULL) {
-        if (mgos_sys_config_get_file_logger_buf_size() >= 0) {
-          setvbuf(
-              s_curfile, NULL,
-              (mgos_sys_config_get_file_logger_buf_line() ? _IOLBF : _IOFBF),
-              mgos_sys_config_get_file_logger_buf_size());
-        }
+        set_file_buf(s_curfile);
         long size = ftell(s_curfile);
         LOG(LL_DEBUG, ("Opened %s (seq %d, size %ld)", newest, s_seq, size));
         if (size <= 0) {
@@ -237,7 +240,7 @@ static bool init_file(size_t msg_len) {
   s_curfile = fopen(curfilename, "w");
   if (s_curfile != NULL) {
     LOG(LL_DEBUG, ("Created %s (seq %d)", curfilename, s_seq));
-    setvbuf(s_curfile, NULL, _IOLBF, 256);
+    set_file_buf(s_curfile);
     res = true;
   }
 
@@ -346,6 +349,21 @@ static void reboot_cb(int ev, void *ev_data, void *userdata) {
 }
 
 #ifdef MGOS_HAVE_RPC_COMMON
+static void file_log_status_handler(struct mg_rpc_request_info *ri,
+                                    void *cb_arg, struct mg_rpc_frame_info *fi,
+                                    struct mg_str args) {
+  char *oldest = NULL, *newest = NULL;
+  int oldest_seq = 0, newest_seq = 0;
+  int num_files = get_oldest_newest(&oldest, &oldest_seq, &newest, &newest_seq);
+  mg_rpc_send_responsef(ri,
+                        "{enable: %B, num_files: %d, oldest: %Q, newest: %Q}",
+                        mgos_sys_config_get_file_logger_enable(), num_files,
+                        (oldest ? oldest : ""), (newest ? newest : ""));
+  (void) fi;
+  (void) args;
+  (void) cb_arg;
+}
+
 static void file_log_flush_rotate_handler(struct mg_rpc_request_info *ri,
                                           void *cb_arg,
                                           struct mg_rpc_frame_info *fi,
@@ -379,6 +397,7 @@ bool mgos_file_logger_init(void) {
 #ifdef MGOS_HAVE_RPC_COMMON
   if (mgos_sys_config_get_file_logger_rpc_service_enable()) {
     struct mg_rpc *c = mgos_rpc_get_global();
+    mg_rpc_add_handler(c, "FileLog.Status", "", file_log_status_handler, NULL);
     mg_rpc_add_handler(c, "FileLog.Flush", "", file_log_flush_rotate_handler,
                        NULL);
     mg_rpc_add_handler(c, "FileLog.Rotate", "", file_log_flush_rotate_handler,
