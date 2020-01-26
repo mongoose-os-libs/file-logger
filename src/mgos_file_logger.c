@@ -22,22 +22,74 @@
 #include "mgos_rpc.h"
 #endif
 
+static FILE *s_curfile = NULL;
 static bool s_rotate = false;
 static bool s_log_wall_time = false;
-static unsigned int s_seq = 0;
-static FILE *s_curfile = NULL;
+static uint8_t s_set = 0;
+static uint8_t s_seq = 0;
 
 // Old name format: log_20200124-002925.706.txt
 static bool is_old_name(const char *name, size_t prefix_len) {
   return (name != NULL && name[prefix_len + 3] != '-');
 }
 
-static unsigned int get_file_seq(const char *name) {
+static bool get_file_seq(const char *name, uint8_t *set, uint8_t *seq) {
   size_t prefix_len = strlen(mgos_sys_config_get_file_logger_prefix());
-  if (name[prefix_len + 3] != '-') return 0;
-  return (((name[prefix_len] - '0') * 100) +
-          ((name[prefix_len + 1] - '0') * 10) + (name[prefix_len + 2] - '0'));
+  if (name[prefix_len + 3] != '-') return false;
+  const char *p = name + prefix_len;
+  *set = (p[0] - '0');
+  *seq = ((p[1] - '0') * 10 + (p[2] - '0'));
+  return true;
 }
+
+/*
+ * Allocates and returns new filename for the log; caller needs to free it.
+ */
+static char *get_new_log_filename(void) {
+  struct mg_str logsdir = mg_mk_str(mgos_sys_config_get_file_logger_dir());
+  char *ret = NULL;
+  int max_seq = mgos_sys_config_get_file_logger_max_num_files() - 1;
+
+  if (s_seq < 100) {
+    s_seq++;
+  } else {
+    s_seq = 0;
+    s_set++;
+    if (s_set > 2 || max_seq == 0) s_set = 0;
+  }
+
+  if (logsdir.len > 0 && logsdir.p[logsdir.len - 1] == '/') {
+    logsdir.len--;
+  }
+
+  double td = mg_time();
+  time_t t = (time_t) td;
+  struct tm tm;
+#ifdef _REENT
+  localtime_r(&t, &tm);
+#else
+  memcpy(&tm, localtime(&t), sizeof(tm));
+#endif
+  mg_asprintf(&ret, 0, "%.*s/%s%d%.2d-%.4d%.2d%.2d-%.2d%.2d%.2d.log",
+              (int) logsdir.len, logsdir.p,
+              mgos_sys_config_get_file_logger_prefix(), s_set, s_seq,
+              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+              tm.tm_min, tm.tm_sec);
+  return ret;
+}
+
+static void set_file_buf(FILE *fp) {
+  if (fp == NULL) return;
+  if (mgos_sys_config_get_file_logger_buf_size() < 0) return;
+  setvbuf(fp, NULL,
+          (mgos_sys_config_get_file_logger_buf_line() ? _IOLBF : _IOFBF),
+          mgos_sys_config_get_file_logger_buf_size());
+}
+
+struct set_info {
+  char *oldest;
+  char *newest;
+};
 
 /*
  * Writes filenames of the oldest and/or newest log files to the provided
@@ -45,17 +97,30 @@ static unsigned int get_file_seq(const char *name) {
  *
  * Returns total number of log files found.
  */
-static int get_oldest_newest(char **poldest, int *oldest_seq, char **pnewest,
-                             int *newest_seq) {
+static int get_oldest_newest(char **oldest, uint8_t *oldest_set,
+                             uint8_t *oldest_seq, char **newest,
+                             uint8_t *newest_set, uint8_t *newest_seq) {
+  /*
+   * To ensure correct and efficient handling of rollover,
+   * files are organized into 3 sets, numbered from 0 to 2.
+   * Each set can have up to 100 files, numbered from 0 to 99.
+   * Sets roll over from 0 to 1 to 2 and back to 0.
+   * For efficiency reasons, we only make one pass over the directory.
+   * We can encounter files from at most two sets at the same time:
+   * 0 only, 0 and 1, 1 only, 1 and 2, 2 only, 2 and 0.
+   * We keep track of maximum and minimum element in the three sets separately
+   * and at the end, based on which sets were seen,
+   * decide from which set to pick.
+   */
   int cnt = 0;
+  struct set_info sets[3] = {{0}, {0}, {0}};
+  char **po = NULL, **pn = NULL;
 
-  if (poldest != NULL) {
-    *poldest = NULL;
-    *oldest_seq = 0;
+  if (oldest != NULL) {
+    *oldest = NULL;
   }
-  if (pnewest != NULL) {
-    *pnewest = NULL;
-    *newest_seq = 0;
+  if (newest != NULL) {
+    *newest = NULL;
   }
 
   DIR *dirp = opendir(mgos_sys_config_get_file_logger_dir());
@@ -66,6 +131,7 @@ static int get_oldest_newest(char **poldest, int *oldest_seq, char **pnewest,
   struct dirent *dp;
   const char *prefix = mgos_sys_config_get_file_logger_prefix();
   size_t prefix_len = strlen(prefix);
+  uint8_t mask = 0;
   while ((dp = readdir(dirp)) != NULL) {
     const char *name = dp->d_name;
     if (strncmp(name, prefix, prefix_len) != 0) {
@@ -80,121 +146,145 @@ static int get_oldest_newest(char **poldest, int *oldest_seq, char **pnewest,
      * so we need to play tricks.
      */
 
+    uint8_t set = 0, seq = 0;
+    if (!get_file_seq(name, &set, &seq) || set > 2) {
+      // Weird stuff (including old names) gots into set 0.
+      set = 0;
+    }
+    mask |= (1 << set);
+    po = &sets[set].oldest;
+    pn = &sets[set].newest;
     bool is_older = false, is_newer = false;
     if (!is_old_name(name, prefix_len)) {
-      if (poldest != NULL) {
-        if (*poldest == NULL) {
+      if (po != NULL) {
+        if (*po == NULL) {
           is_older = true;
-        } else if (is_old_name(*poldest, prefix_len)) {
+        } else if (is_old_name(*po, prefix_len)) {
           is_older = false;  // New name is never older than old.
         } else {
-          is_older = (strcmp(name, *poldest) < 0);
+          is_older = (strcmp(name, *po) < 0);
         }
       }
-      if (pnewest != NULL) {
-        is_newer = (*pnewest == NULL || strcmp(name, *pnewest) > 0);
+      if (pn != NULL) {
+        is_newer = (*pn == NULL || strcmp(name, *pn) > 0);
       }
     } else {
-      if (poldest != NULL) {
-        if (*poldest == NULL) {
+      if (po != NULL) {
+        if (*po == NULL) {
           is_older = true;
-        } else if (is_old_name(*poldest, prefix_len)) {
-          is_older = (strcmp(name, *poldest) < 0);
+        } else if (is_old_name(*po, prefix_len)) {
+          is_older = (strcmp(name, *po) < 0);
         } else {
           is_older = true;
         }
       }
-      /* Never pick file with old name as newest, better create a new one. */
+      // Never pick file with old name as newest, better create a new one.
       is_newer = false;
     }
     if (is_older) {
-      free(*poldest);
-      *poldest = strdup(name);
+      free(*po);
+      *po = strdup(name);
     }
     if (is_newer) {
-      free(*pnewest);
-      *pnewest = strdup(name);
+      free(*pn);
+      *pn = strdup(name);
     }
-  }
-
-  if (poldest != NULL && *poldest != NULL) {
-    char *tmp = *poldest;
-    *poldest = NULL;
-    *oldest_seq = get_file_seq(tmp);
-    mg_asprintf(poldest, 0, "%s/%s", mgos_sys_config_get_file_logger_dir(),
-                tmp);
-    free(tmp);
-  }
-
-  if (pnewest != NULL && *pnewest != NULL) {
-    char *tmp = *pnewest;
-    *pnewest = NULL;
-    *newest_seq = get_file_seq(tmp);
-    mg_asprintf(pnewest, 0, "%s/%s", mgos_sys_config_get_file_logger_dir(),
-                tmp);
-    free(tmp);
   }
 
   closedir(dirp);
 
-  return cnt;
-}
-
-/*
- * Allocates and returns new filename for the log; caller needs to free it.
- */
-static char *get_new_log_filename(void) {
-  struct mg_str logsdir = mg_mk_str(mgos_sys_config_get_file_logger_dir());
-  char *ret = NULL;
-
-  s_seq++;
-  if (s_seq >= 1000) s_seq = 0;
-
-  if (logsdir.len > 0 && logsdir.p[logsdir.len - 1] == '/') {
-    logsdir.len--;
+  // Determine which set to use for oldest and newest.
+  switch (mask) {
+    default:  // everything else -> set 0.
+              // fall through
+    case 1:   // 001
+      po = &sets[0].oldest;
+      pn = &sets[0].newest;
+      break;
+    case 3:  // 011
+      po = &sets[0].oldest;
+      pn = &sets[1].newest;
+      break;
+    case 2:  // 010
+      po = &sets[1].oldest;
+      pn = &sets[1].newest;
+      break;
+    case 6:  // 110
+      po = &sets[1].oldest;
+      pn = &sets[2].newest;
+      break;
+    case 4:  // 100
+      po = &sets[2].oldest;
+      pn = &sets[2].newest;
+      break;
+    case 5:  // 101
+      po = &sets[2].oldest;
+      pn = &sets[0].newest;
+      break;
   }
 
-  double td = mg_time();
-  time_t t = (time_t) td;
-  struct tm tm;
-#ifdef _REENT
-  localtime_r(&t, &tm);
-#else
-  memcpy(&tm, localtime(&t), sizeof(tm));
-#endif
-  mg_asprintf(&ret, 0, "%.*s/%s%.3d-%.4d%.2d%.2d-%.2d%.2d%.2d.log",
-              (int) logsdir.len, logsdir.p,
-              mgos_sys_config_get_file_logger_prefix(), s_seq,
-              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
-              tm.tm_min, tm.tm_sec);
-  return ret;
-}
+  // Copy out the results, adding directory.
+  // Avoiding (a)sprintf to reduce stack usage.
+  size_t dir_len = strlen(mgos_sys_config_get_file_logger_dir());
+  if (oldest != NULL && *po != NULL) {
+    char *tmp = *po;
+    size_t tmp_len = strlen(tmp);
+    *po = NULL;
+    get_file_seq(tmp, oldest_set, oldest_seq);
+    *oldest = calloc(1, dir_len + 1 + tmp_len + 1);
+    if (*oldest != NULL) {
+      memcpy(*oldest, mgos_sys_config_get_file_logger_dir(), dir_len);
+      (*oldest)[dir_len] = '/';
+      memcpy((*oldest) + dir_len + 1, tmp, tmp_len);
+    }
+    free(tmp);
+  }
 
-static void set_file_buf(FILE *fp) {
-  if (fp == NULL) return;
-  if (mgos_sys_config_get_file_logger_buf_size() < 0) return;
-  setvbuf(fp, NULL,
-          (mgos_sys_config_get_file_logger_buf_line() ? _IOLBF : _IOFBF),
-          mgos_sys_config_get_file_logger_buf_size());
+  if (newest != NULL && *pn != NULL) {
+    char *tmp = *pn;
+    size_t tmp_len = strlen(tmp);
+    *pn = NULL;
+    get_file_seq(tmp, newest_set, newest_seq);
+    *newest = calloc(1, dir_len + 1 + tmp_len + 1);
+    if (*newest != NULL) {
+      memcpy(*newest, mgos_sys_config_get_file_logger_dir(), dir_len);
+      (*newest)[dir_len] = '/';
+      memcpy((*newest) + dir_len + 1, tmp, tmp_len);
+    }
+    free(tmp);
+  }
+
+  // Free unused strings.
+  for (int i = 0; i < 3; i++) {
+    free(sets[i].oldest);
+    free(sets[i].newest);
+  }
+
+  return cnt;
 }
 
 static bool init_file(size_t msg_len) {
   bool res = false;
-  int num_files = -1;
+  int num_files = -1,
+      max_files = mgos_sys_config_get_file_logger_max_num_files();
   char *curfilename = NULL;
   char *oldest = NULL, *newest = NULL;
-  int oldest_seq = 0, newest_seq = 0;
+  uint8_t oldest_set = 0, oldest_seq = 0;
+  uint8_t newest_set = 0, newest_seq = 0;
 
   // No file open? Open latest, if any.
   if (s_curfile == NULL) {
-    num_files = get_oldest_newest(&oldest, &oldest_seq, &newest, &newest_seq);
-    if (num_files > 0 && !s_rotate && newest != NULL) {
+    num_files = get_oldest_newest(&oldest, &oldest_set, &oldest_seq, &newest,
+                                  &newest_set, &newest_seq);
+    if (newest != NULL && !s_rotate) {
+      s_set = newest_set;
       s_seq = newest_seq;
       s_curfile = fopen(newest, "a");
       if (s_curfile != NULL) {
         set_file_buf(s_curfile);
         long size = ftell(s_curfile);
-        LOG(LL_DEBUG, ("Opened %s (seq %d, size %ld)", newest, s_seq, size));
+        LOG(LL_DEBUG,
+            ("Opened %s (seq %d/%d, size %ld)", newest, s_set, s_seq, size));
         if (size <= 0) {
           /* It's a trap! FIle cannot be zero size, likely FS corruption.
            * Try to re-create. */
@@ -204,8 +294,13 @@ static bool init_file(size_t msg_len) {
           s_curfile = NULL;
         }
       }
-    } else if (num_files > 0 && s_rotate) {
+    } else if (newest != NULL) {
+      s_set = newest_set;
       s_seq = newest_seq;
+    } else {
+      // Start at 0.
+      s_set = 2;
+      s_seq = (uint8_t) -1;
     }
     s_rotate = false;
   }
@@ -222,26 +317,32 @@ static bool init_file(size_t msg_len) {
     }
   }
 
-  // Need to open a new file. Check file count first, make room if needed.
+  // Check file count, we may need to clean up extra file(s).
   if (num_files < 0) {
-    num_files = get_oldest_newest(&oldest, &oldest_seq, NULL, NULL);
+    num_files =
+        get_oldest_newest(&oldest, &oldest_set, &oldest_seq, NULL, NULL, NULL);
   }
-  while (num_files >= mgos_sys_config_get_file_logger_max_num_files()) {
-    LOG(LL_DEBUG, ("Removing %s", oldest));
-    remove(oldest);
+  while (num_files >= max_files) {
+    if (remove(oldest) == 0) {
+      LOG(LL_DEBUG, ("Removed %s", oldest));
+    }
     free(oldest);
     oldest = NULL;
     num_files--;
     if (num_files < mgos_sys_config_get_file_logger_max_num_files()) break;
-    num_files = get_oldest_newest(&oldest, &oldest_seq, NULL, NULL);
+    num_files =
+        get_oldest_newest(&oldest, &oldest_set, &oldest_seq, NULL, NULL, NULL);
   }
 
-  curfilename = get_new_log_filename();
-  s_curfile = fopen(curfilename, "w");
-  if (s_curfile != NULL) {
-    LOG(LL_DEBUG, ("Created %s (seq %d)", curfilename, s_seq));
-    set_file_buf(s_curfile);
-    res = true;
+  // Could not open an existing file? Create a new one.
+  if (s_curfile == 0) {
+    curfilename = get_new_log_filename();
+    s_curfile = fopen(curfilename, "w");
+    if (s_curfile != NULL) {
+      LOG(LL_DEBUG, ("Created %s (seq %d/%d)", curfilename, s_set, s_seq));
+      set_file_buf(s_curfile);
+      res = true;
+    }
   }
 
 out:
@@ -353,8 +454,10 @@ static void file_log_status_handler(struct mg_rpc_request_info *ri,
                                     void *cb_arg, struct mg_rpc_frame_info *fi,
                                     struct mg_str args) {
   char *oldest = NULL, *newest = NULL;
-  int oldest_seq = 0, newest_seq = 0;
-  int num_files = get_oldest_newest(&oldest, &oldest_seq, &newest, &newest_seq);
+  uint8_t oldest_set = 0, oldest_seq = 0;
+  uint8_t newest_set = 0, newest_seq = 0;
+  int num_files = get_oldest_newest(&oldest, &oldest_set, &oldest_seq, &newest,
+                                    &newest_set, &newest_seq);
   mg_rpc_send_responsef(ri,
                         "{enable: %B, num_files: %d, oldest: %Q, newest: %Q}",
                         mgos_sys_config_get_file_logger_enable(), num_files,
@@ -380,6 +483,10 @@ static void file_log_flush_rotate_handler(struct mg_rpc_request_info *ri,
 #endif
 
 bool mgos_file_logger_init(void) {
+  if (mgos_sys_config_get_file_logger_max_num_files() > 100) {
+    return false;
+  }
+
   if (mgos_sys_config_get_file_logger_timestamps()) {
     if (mgos_time_micros() > 0x4000000000000) {
       // Wall time is set, log it with the first message.
