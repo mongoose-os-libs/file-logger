@@ -184,7 +184,12 @@ static bool init_file(size_t msg_len) {
       s_seq = newest_seq;
       s_curfile = fopen(newest, "a");
       if (s_curfile != NULL) {
-        setvbuf(s_curfile, NULL, _IOLBF, 256);
+        if (mgos_sys_config_get_file_logger_buf_size() >= 0) {
+          setvbuf(
+              s_curfile, NULL,
+              (mgos_sys_config_get_file_logger_buf_line() ? _IOLBF : _IOFBF),
+              mgos_sys_config_get_file_logger_buf_size());
+        }
         long size = ftell(s_curfile);
         LOG(LL_DEBUG, ("Opened %s (seq %d, size %ld)", newest, s_seq, size));
         if (size <= 0) {

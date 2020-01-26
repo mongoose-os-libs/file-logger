@@ -21,6 +21,8 @@ config_schema:
   - ["file_logger.include", "s", "", {"title": "A comma-separated list of substrings. If set, only messages containing one of these are logged."}]
   - ["file_logger.syslog_enable", "b", true, {"title": "Capture system log messages"}]
   - ["file_logger.rpc_service_enable", "b", false, {"title": "Export RPC service for management"}]
+  - ["file_logger.buf_size", "i", 256, {"title": "Buffer size"}]
+  - ["file_logger.buf_line", "b", true, {"title": "Line-buffering (flush after each line)"}]
 
 tags:
   - c
