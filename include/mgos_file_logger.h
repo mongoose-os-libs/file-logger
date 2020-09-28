@@ -34,6 +34,10 @@ void mgos_file_log_flush(void);
 
 void mgos_file_log_rotate(void);
 
+// Returns current file name or NULL if disabled.
+// Returned string must be freed.
+char *mgos_file_log_get_cur_file_name(void);
+
 #ifdef __cplusplus
 }
 #endif

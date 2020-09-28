@@ -22,7 +22,9 @@
 #include "mgos_rpc.h"
 #endif
 
+static bool s_disable = false;
 static FILE *s_curfile = NULL;
+static char *s_curfile_name = NULL;
 static bool s_rotate = false;
 static bool s_log_wall_time = false;
 static uint8_t s_set = 0;
@@ -267,7 +269,6 @@ static bool init_file(size_t msg_len) {
   bool res = false;
   int num_files = -1,
       max_files = mgos_sys_config_get_file_logger_max_num_files();
-  char *curfilename = NULL;
   char *oldest = NULL, *newest = NULL;
   uint8_t oldest_set = 0, oldest_seq = 0;
   uint8_t newest_set = 0, newest_seq = 0;
@@ -286,12 +287,15 @@ static bool init_file(size_t msg_len) {
         LOG(LL_DEBUG,
             ("Opened %s (seq %d/%d, size %ld)", newest, s_set, s_seq, size));
         if (size <= 0) {
-          /* It's a trap! FIle cannot be zero size, likely FS corruption.
+          /* It's a trap! File cannot be zero size, likely FS corruption.
            * Try to re-create. */
           LOG(LL_INFO, ("Found truncated file %s, re-creating", newest));
           fclose(s_curfile);
           remove(newest);
           s_curfile = NULL;
+        } else {
+          s_curfile_name = newest;
+          newest = NULL;
         }
       }
     } else if (newest != NULL) {
@@ -335,25 +339,27 @@ static bool init_file(size_t msg_len) {
   }
 
   // Could not open an existing file? Create a new one.
-  if (s_curfile == 0) {
-    curfilename = get_new_log_filename();
-    s_curfile = fopen(curfilename, "w");
+  if (s_curfile == NULL) {
+    s_curfile_name = get_new_log_filename();
+    s_curfile = fopen(s_curfile_name, "w");
     if (s_curfile != NULL) {
-      LOG(LL_DEBUG, ("Created %s (seq %d/%d)", curfilename, s_set, s_seq));
+      LOG(LL_DEBUG, ("Created %s (seq %d/%d)", s_curfile_name, s_set, s_seq));
       set_file_buf(s_curfile);
       res = true;
+    } else {
+      free(s_curfile_name);
+      s_curfile_name = NULL;
     }
   }
 
 out:
-  free(curfilename);
   free(oldest);
   free(newest);
   return res;
 }
 
 static bool should_log(enum cs_log_level level, struct mg_str msg) {
-  if (!mgos_sys_config_get_file_logger_enable()) return false;
+  if (!mgos_sys_config_get_file_logger_enable() || s_disable) return false;
   if (level > mgos_sys_config_get_file_logger_level()) return false;
   bool res = true;
   struct mg_str inc = mg_mk_str(mgos_sys_config_get_file_logger_include());
@@ -434,6 +440,8 @@ void mgos_file_log_flush(void) {
   if (s_curfile == NULL) return;
   fclose(s_curfile);
   s_curfile = NULL;
+  free(s_curfile_name);
+  s_curfile_name = NULL;
 }
 
 void mgos_file_log_rotate(void) {
@@ -442,8 +450,14 @@ void mgos_file_log_rotate(void) {
   s_rotate = true;
 }
 
+char *mgos_file_log_get_cur_file_name(void) {
+  if (s_curfile_name == NULL) return NULL;
+  return strdup(s_curfile_name);
+}
+
 static void reboot_cb(int ev, void *ev_data, void *userdata) {
   mgos_file_log_flush();
+  s_disable = true;
   (void) ev;
   (void) ev_data;
   (void) userdata;
