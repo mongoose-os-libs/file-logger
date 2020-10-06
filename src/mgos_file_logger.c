@@ -313,8 +313,7 @@ static bool init_file(size_t msg_len) {
   if (s_curfile != NULL) {
     if (ftell(s_curfile) + (long) msg_len >
         mgos_sys_config_get_file_logger_max_file_size()) {
-      fclose(s_curfile);
-      s_curfile = NULL;
+      mgos_file_log_flush();
     } else {
       res = true;
       goto out;
