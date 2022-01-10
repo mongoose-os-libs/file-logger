@@ -454,6 +454,18 @@ char *mgos_file_log_get_cur_file_name(void) {
   return strdup(s_curfile_name);
 }
 
+char *mgos_file_log_get_oldest_file_name(void) {
+  char *oldest = NULL;
+  get_oldest_newest(&oldest, NULL, NULL, NULL, NULL, NULL);
+  return oldest;
+}
+
+char *mgos_file_log_get_newest_file_name(void) {
+  char *newest = NULL;
+  get_oldest_newest(NULL, NULL, NULL, &newest, NULL, NULL);
+  return newest;
+}
+
 static void reboot_cb(int ev, void *ev_data, void *userdata) {
   mgos_file_log_flush();
   s_disable = true;

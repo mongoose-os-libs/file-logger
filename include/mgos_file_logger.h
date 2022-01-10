@@ -38,6 +38,11 @@ void mgos_file_log_rotate(void);
 // Returned string must be freed.
 char *mgos_file_log_get_cur_file_name(void);
 
+// Returns the oldest and newest log file names.
+// Returned string must be freed.
+char *mgos_file_log_get_oldest_file_name(void);
+char *mgos_file_log_get_newest_file_name(void);
+
 #ifdef __cplusplus
 }
 #endif
